@@ -75,38 +75,49 @@ class ResnetEnc(nn.Module):
         super().__init__()
         self.img_hw = img_hw
         self.c_dim = c_dim
-        model = list(resnet18(pretrained=False, norm_layer=GroupNorm32).children())
+        model = list(resnet18(pretrained=False).children())
+        self.head = nn.Sequential(*model[:8])
+        self.tail = nn.Sequential(nn.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False),
+                                    nn.Conv2d(in_channels=512, out_channels=z_dim, kernel_size=1),
+                                    nn.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+                                    )
+
+        # model = list(resnet18(pretrained=False, norm_layer=GroupNorm32).children())
         feat_hw = 4
-        self.head = nn.Sequential(*model[:4])
-        self.y_head = nn.Sequential(nn.AdaptiveAvgPool2d(8),
-                                    nn.Flatten(),
-                                    nn.Linear(8 * 8 * 64, z_dim // 2),
-                                    # nn.BatchNorm1d(z_dim // 2),
-                                    nn.ReLU())
-        self.body = nn.Sequential(*model[4:9])
-        self.z_head = nn.Sequential(nn.Flatten(),
-                                    nn.Linear(512, z_dim // 2),
-                                    # nn.BatchNorm1d(z_dim // 2),
-                                    nn.ReLU())
+        # self.head = nn.Sequential(*model[:4])
+        # self.y_head = nn.Sequential(nn.AdaptiveAvgPool2d(8),
+        #                             nn.Flatten(),
+        #                             nn.Linear(8 * 8 * 64, z_dim // 2),
+        #                             # nn.BatchNorm1d(z_dim // 2),
+        #                             nn.ReLU())
+        # self.body = nn.Sequential(*model[4:9])
+        # self.z_head = nn.Sequential(nn.Flatten(),
+        #                             nn.Linear(512, z_dim // 2),
+        #                             # nn.BatchNorm1d(z_dim // 2),
+        #                             nn.ReLU())
 
     def forward(self, imgs):
         n = imgs.shape[0]
-        x = self.head(imgs)
-        y = self.y_head(x)
-        x = self.body(x)
-        z = self.z_head(x)
-        z = torch.cat([z, y], dim=1)
-        return z
+        z = self.head(imgs)
+        z = self.tail(z)
+        # x = self.head(imgs)
+        # y = self.y_head(x)
+        # x = self.body(x)
+        # z = self.z_head(x)
+        # z = torch.cat([z, y], dim=1)
+        return z.reshape(z.shape[0], -1)
 
 if __name__ == '__main__':
-    resnet = ResnetEnc(4, img_hw=128)
+    resnet = ResnetEnc(z_dim=256, c_dim=3, img_hw=128)
+    print(resnet)
+
     img = torch.rand(4, 3, 128, 128)
     out = resnet(img)
     print(out.shape)
 
 # Model
 class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, input_code_ch=512, output_ch=4, skips=[4], use_viewdirs=False):
+    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, input_code_ch=256, output_ch=4, skips=[4], use_viewdirs=False):
         """ 
         """
         super(NeRF, self).__init__()
@@ -120,7 +131,7 @@ class NeRF(nn.Module):
         
         # # remove shape_code change 
         self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
+            [nn.Linear(input_ch + input_code_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
         
         ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
@@ -139,8 +150,8 @@ class NeRF(nn.Module):
     def forward(self, x, shape_codes):
         # Nx63, Nx27
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
-        # h = torch.cat((input_pts, shape_codes), dim=1)
-        h = input_pts # # remove shape_code change
+        h = torch.cat((input_pts, shape_codes), dim=1)
+        # h = input_pts # # remove shape_code change
         for i, l in enumerate(self.pts_linears):
             h = self.pts_linears[i](h)
             h = F.relu(h)

@@ -57,57 +57,57 @@ def pose_spherical(theta, phi, radius):
     return c2w
 
 
-class PlaneTEST(Dataset):
-    def __init__(self, img_path, mask_path, depth_path, camera_path, img_size):
-        super().__init__()
-        self.imgs = glob.glob(img_path)
-        self.imgs.sort()
-        self.masks = glob.glob(mask_path)
-        self.masks.sort()
-        self.depths = glob.glob(depth_path)
-        self.depths.sort()
+# class PlaneTEST(Dataset):
+#     def __init__(self, img_path, mask_path, depth_path, camera_path, img_size):
+#         super().__init__()
+#         self.imgs = glob.glob(img_path)
+#         self.imgs.sort()
+#         self.masks = glob.glob(mask_path)
+#         self.masks.sort()
+#         self.depths = glob.glob(depth_path)
+#         self.depths.sort()
         
-        assert len(self.imgs) > 0, "Can't find data; make sure you specify the path to your dataset"
-        self.to_tensor = transforms.ToTensor()
-        self.resize = transforms.Resize((img_size, img_size))
-        self.img_size = img_size
+#         assert len(self.imgs) > 0, "Can't find data; make sure you specify the path to your dataset"
+#         self.to_tensor = transforms.ToTensor()
+#         self.resize = transforms.Resize((img_size, img_size))
+#         self.img_size = img_size
 
-        self.camera_list = []
-        if os.path.isfile(camera_path):
-            with open(camera_path, 'r') as f:
-                camera = f.read().split('\n')[:-1]
-                self.camera_list.extend(camera) 
-        else:
-            print("can't find rendering_metadata.txt")
-            exit(1)
+#         self.camera_list = []
+#         if os.path.isfile(camera_path):
+#             with open(camera_path, 'r') as f:
+#                 camera = f.read().split('\n')[:-1]
+#                 self.camera_list.extend(camera) 
+#         else:
+#             print("can't find rendering_metadata.txt")
+#             exit(1)
 
-        self.imgs , self.masks, self.depths, self.camera_list = self.imgs[40:50], self.masks[40:50], self.depths[40:50], self.camera_list[40:50] # change
-        self.focal = 1113.16 # # size=800
-        self.focal = self.focal * (float(self.img_size) / 800.) 
+#         self.imgs , self.masks, self.depths, self.camera_list = self.imgs[40:50], self.masks[40:50], self.depths[40:50], self.camera_list[40:50] # change
+#         self.focal = 1113.16 # # size=800
+#         self.focal = self.focal * (float(self.img_size) / 800.) 
 
 
-    def __len__(self):
-        return len(self.imgs)
+#     def __len__(self):
+#         return len(self.imgs)
 
-    def __getitem__(self, index):
-        img = PIL.Image.open(self.imgs[index]).convert('RGB')
-        img = self.resize(self.to_tensor(img))
-        mask = PIL.Image.open(self.masks[index])
-        mask = self.resize(self.to_tensor(mask))
-        depth = torch.from_numpy(np.load(self.depths[index])[np.newaxis, ...])
-        depth = self.resize(depth)
+#     def __getitem__(self, index):
+#         img = PIL.Image.open(self.imgs[index]).convert('RGB')
+#         img = self.resize(self.to_tensor(img))
+#         mask = PIL.Image.open(self.masks[index])
+#         mask = self.resize(self.to_tensor(mask))
+#         depth = torch.from_numpy(np.load(self.depths[index])[np.newaxis, ...])
+#         depth = self.resize(depth)
 
-        camera = self.camera_list[index].split(' ')
-        az = float(camera[0]) 
-        el = float(camera[1]) 
-        rho = float(camera[3])
+#         camera = self.camera_list[index].split(' ')
+#         az = float(camera[0]) 
+#         el = float(camera[1]) 
+#         rho = float(camera[3])
 
-        c2w = pose_spherical(az, el, rho)
-        # print(c2w)
-        rgb = img.permute(1, 2, 0)
-        mask = mask.permute(1, 2, 0)
-        rgb = rgb*mask + (1.-mask) # white bg b default
-        return rgb, mask, depth, c2w, [self.img_size, self.img_size, self.focal]
+#         c2w = pose_spherical(az, el, rho)
+#         # print(c2w)
+#         rgb = img.permute(1, 2, 0)
+#         mask = mask.permute(1, 2, 0)
+#         rgb = rgb*mask + (1.-mask) # white bg b default
+#         return rgb, mask, depth, c2w, [self.img_size, self.img_size, self.focal]
 
 
 
@@ -135,7 +135,7 @@ class Plane(Dataset):
             print("can't find rendering_metadata.txt")
             exit(1)
 
-        self.imgs , self.masks, self.depths, self.camera_list = self.imgs[:40], self.masks[:40], self.depths[:40], self.camera_list[:40] # change
+        # self.imgs , self.masks, self.depths, self.camera_list = self.imgs[:40], self.masks[:40], self.depths[:40], self.camera_list[:40] # change
         self.focal = 1113.16 # # size=800
         self.focal = self.focal * (float(self.img_size) / 800.) 
 
@@ -160,7 +160,7 @@ class Plane(Dataset):
         # print(c2w)
         rgb = img.permute(1, 2, 0)
         mask = mask.permute(1, 2, 0)
-        rgb = rgb*mask + (1.-mask) # white bg b default
+        rgb = rgb*mask + (1.-mask) # white bg by default
         return rgb, mask, depth, c2w, [self.img_size, self.img_size, self.focal]
 
 

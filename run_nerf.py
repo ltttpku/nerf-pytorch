@@ -26,7 +26,7 @@ from datasets.datasets import *
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
-
+device_ids = []
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
@@ -218,18 +218,23 @@ def create_nerf(args):
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
     grad_vars = list(model.parameters())
 
+    if len(device_ids)>1:
+        model=torch.nn.DataParallel(model, device_ids=device_ids)#前提是model已经.cuda() 了
+
     model_fine = None
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine, input_code_ch=args.code_dim,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
-
+        if len(device_ids)>1:
+            model_fine=torch.nn.DataParallel(model_fine, device_ids=device_ids)#前提是model已经.cuda() 了
     # # remove shape_code change
-    encoder = None
-    # encoder = ResnetEnc(z_dim=args.code_dim, img_hw=args.img_size)
-    # grad_vars += list(encoder.parameters())
-
+    # encoder = None
+    encoder = ResnetEnc(z_dim=args.code_dim, c_dim=3, img_hw=args.img_size)
+    grad_vars += list(encoder.parameters())
+    if len(device_ids)>1:
+        encoder=torch.nn.DataParallel(encoder, device_ids=device_ids)#前提是model已经.cuda() 了
 
     network_query_fn = lambda inputs, shape_codes, viewdirs, network_fn : run_network(inputs, shape_codes, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
@@ -262,7 +267,7 @@ def create_nerf(args):
 
         # Load model
         model.load_state_dict(ckpt['network_fn_state_dict'])
-        # encoder.load_state_dict(ckpt['encoder_state_dict'])
+        encoder.load_state_dict(ckpt['encoder_state_dict'])
         if model_fine is not None:
             model_fine.load_state_dict(ckpt['network_fine_state_dict'])
 
@@ -585,9 +590,18 @@ def config_parser():
 
 
 def train():
-
+    global device_ids
     parser = config_parser()
     args = parser.parse_args()
+
+    args.gpu_id="2,3,4" ; #指定gpu id
+    args.cuda = torch.cuda.is_available() #作为是否使用cpu的判定
+    #配置环境  也可以在运行时临时指定 CUDA_VISIBLE_DEVICES='2,7' Python train.py
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id #这里的赋值必须是字符串，list会报错
+    # device_ids=range(torch.cuda.device_count())  #torch.cuda.device_count()=2
+    #device_ids=[0,1] 这里的0 就是上述指定 2，是主gpu,  1就是7,模型和数据由主gpu分发
+    device_ids = []
+    
 
     # Load data
     K = None
@@ -716,11 +730,11 @@ def train():
                             batch_size=args.batch_size)
 
     # # change 
-    test_data = get_dataset(name='PlaneTEST',
-                            img_path= '/data2/ShapeNetPlanes/train/rgb/*.png',
-                            mask_path= '/data2/ShapeNetPlanes/train/mask/*.png',
-                            depth_path= '/data2/ShapeNetPlanes/train/depth/*.npy',
-                            camera_path = '/data2/ShapeNetPlanes/train/rendering_metadata.txt', 
+    test_data = get_dataset(name='Plane',
+                            img_path= '/data2/ShapeNetPlanes/test/rgb/*.png',
+                            mask_path= '/data2/ShapeNetPlanes/test/mask/*.png',
+                            depth_path= '/data2/ShapeNetPlanes/test/depth/*.npy',
+                            camera_path = '/data2/ShapeNetPlanes/test/rendering_metadata.txt', 
                             img_size=args.img_size,
                             batch_size=4)
 
@@ -842,7 +856,7 @@ def train():
             batch_rays_lst, target_s_lst, target_depth_lst = [], [], []
             new_gt_rgb = rgbs.clone().detach()
             new_gt_rgb = new_gt_rgb.permute(0, 3, 1, 2)
-            # shape_code = encoder(new_gt_rgb) # Bx512
+            shape_code = encoder(new_gt_rgb) # Bx512
 
             for batch in range(args.batch_size):
                 c2w, gt_rgb, gt_dep = poses[batch], rgbs[batch], depths[batch]
@@ -858,11 +872,11 @@ def train():
             target_d = torch.cat(target_depth_lst, dim=0)
             # print(shape_code)
             # change i.e. remove this line when code_dim=0
-            # shape_codes = shape_code.repeat(1, args.N_rand).reshape(-1, args.code_dim)
-            shape_codes = torch.zeros(args.batch_size, 4)
+            shape_codes = shape_code.repeat(1, args.N_rand).reshape(-1, args.code_dim)
+            # shape_codes = torch.zeros(args.batch_size, 4)
 
             #####  Core optimization loop  #####
-            # shape_codes = torch.rand(2, 512)
+
             rgb, disp, acc, depth, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                      retraw=True, shape_codes=shape_codes,
                                                     **render_kwargs_train)
@@ -929,7 +943,7 @@ def train():
                 print('train poses shape', poses[:4].shape) # 最多render 4张看
                 with torch.no_grad():
                     shape_code = torch.zeros(4, 4)
-                    # shape_code = encoder(rgbs[:4].permute(0, 3, 1, 2).cuda())
+                    shape_code = encoder(rgbs[:4].permute(0, 3, 1, 2).cuda())
                     rgbs, disps, depths = render_path(poses[:4].to(device), [H, W, focal], K, shape_code, args.chunk, render_kwargs_test, gt_imgs=rgbs[:4], gt_deps=depths[:4], savedir=trainsavedir)
                 print('Saved train set')
                 tensor_rgbs = [torch.from_numpy(rgb) for rgb in rgbs[:4]]
@@ -950,7 +964,7 @@ def train():
                 print('test poses shape', poses.shape)
                 with torch.no_grad():
                     shape_code = torch.zeros(4, 4)
-                    # shape_code = encoder(rgbs.permute(0, 3, 1, 2).cuda())
+                    shape_code = encoder(rgbs.permute(0, 3, 1, 2).cuda())
                     rgbs, disps, depths = render_path(poses.to(device), hwf, K, shape_code, args.chunk, render_kwargs_test, gt_imgs=rgbs, gt_deps=depths, savedir=testsavedir)
                 print('Saved test set')
                 tensor_rgbs = [torch.from_numpy(rgb) for rgb in rgbs[:4]]
@@ -972,7 +986,7 @@ def train():
                 # Turn on testing mode
                 with torch.no_grad():
                     shape_code = torch.zeros(4, 4)
-                    # shape_code = encoder(rgbs[:1,...].permute(0,3, 1,2).cuda())
+                    shape_code = encoder(rgbs[:1,...].permute(0,3, 1,2).cuda())
                     rgbs, disps, depths = render_path(render_poses, hwf, K, shape_code, args.chunk, render_kwargs_test)
                 print('Done, saving', rgbs.shape, disps.shape, depths.shape)
                 moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
