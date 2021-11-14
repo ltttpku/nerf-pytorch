@@ -216,7 +216,7 @@ def get_rays_sample(H, W, K, c2w, gt_rgb, gt_depth, i, precrop_iters, precrop_fr
     rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
     batch_rays = torch.stack([rays_o, rays_d], 0)
     target_s = gt_rgb[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-    target_d = gt_depth[select_coords[:, 0], select_coords[:, 1]] # (N_rand, 3)
+    target_d = gt_depth[select_coords[:, 0], select_coords[:, 1]] # (N_rand)
     return batch_rays, target_s, target_d
 
 # Ray helpers
