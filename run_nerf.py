@@ -757,8 +757,8 @@ def train():
             pbar.update(1)
             i = epoch * len(train_data) + num_iter
 
-            near = 0.2
-            far = 2.0
+            near = 0.7
+            far = 1.7
             # Cast intrinsics to right types
             H, W, focal = hwf[0][0], hwf[1][0], hwf[2][0]
             H, W, focal = int(H), int(W), float(focal)
@@ -941,11 +941,17 @@ def train():
                     'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
                     'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
+                    'encoder_shape_state_dict': encoder_shape.state_dict(),
+                    'encoder_appearence_state_dict': encoder_appearence.state_dict(),
                 }, path)
                 print('Saved checkpoints at', path)
                 logger.save_stats('stats.p')
                 print("Saved logger")
             
+            encoder_shape.eval()
+            encoder_appearence.eval()
+            render_kwargs_test['network_fn'].eval()
+            render_kwargs_test['network_fine'].eval()
             if i%args.i_trainset==0 and i > 0 or i == 5: # change
                 trainsavedir = os.path.join(basedir, expname, 'trainset_{:06d}'.format(i))
                 os.makedirs(trainsavedir, exist_ok=True)
@@ -1021,7 +1027,11 @@ def train():
                 #     render_kwargs_test['c2w_staticcam'] = None
                 #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
 
-
+            encoder_shape.train()
+            encoder_appearence.train()
+            render_kwargs_test['network_fn'].train()
+            render_kwargs_test['network_fine'].train()
+            
             # log learning rate
             logger.add('learning rates', 'whole', optimizer.param_groups[0]['lr'], i)
             # log losses
@@ -1082,5 +1092,4 @@ def train():
 
 if __name__=='__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
-
     train()
