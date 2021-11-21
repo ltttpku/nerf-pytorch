@@ -233,11 +233,14 @@ def create_nerf(args):
         if len(device_ids)>1:
             model_fine=torch.nn.DataParallel(model_fine, device_ids=device_ids)#前提是model已经.cuda() 了
     # # remove shape_code change
-    # encoder = None
-    encoder = ResnetEnc(z_dim=args.code_dim, c_dim=3, img_hw=args.img_size)
-    grad_vars += list(encoder.parameters())
+    # encoder_shape = None
+    encoder_shape = ResnetEnc(z_dim=args.code_dim, c_dim=3, img_hw=args.img_size)
+    grad_vars += list(encoder_shape.parameters())
+    encoder_appearence = ResnetEnc(z_dim=args.code_dim, c_dim=3, img_hw=args.img_size)
+    grad_vars += list(encoder_appearence.parameters())
+
     if len(device_ids)>1:
-        encoder=torch.nn.DataParallel(encoder, device_ids=device_ids)#前提是model已经.cuda() 了
+        encoder_shape=torch.nn.DataParallel(encoder_shape, device_ids=device_ids)#前提是model已经.cuda() 了
 
     network_query_fn = lambda inputs, shape_codes, viewdirs, network_fn : run_network(inputs, shape_codes, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
@@ -270,7 +273,8 @@ def create_nerf(args):
 
         # Load model
         model.load_state_dict(ckpt['network_fn_state_dict'])
-        encoder.load_state_dict(ckpt['encoder_state_dict'])
+        encoder_shape.load_state_dict(ckpt['encoder_shape_state_dict'])
+        encoder_appearence.load_state_dict(ckpt['encoder_appearence_state_dict'])
         if model_fine is not None:
             model_fine.load_state_dict(ckpt['network_fine_state_dict'])
 
@@ -286,7 +290,7 @@ def create_nerf(args):
         'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
         'raw_noise_std' : args.raw_noise_std,
-        # 'encoder': encoder,
+        # 'encoder_shape': encoder_shape,
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -300,7 +304,7 @@ def create_nerf(args):
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
 
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, encoder
+    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, encoder_shape, encoder_appearence
 
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
@@ -717,7 +721,7 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, encoder = create_nerf(args)
+    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, encoder_shape , encoder_appearence= create_nerf(args)
     global_step = start
 
 
@@ -859,7 +863,8 @@ def train():
             batch_rays_lst, target_s_lst, target_depth_lst = [], [], []
             new_gt_rgb = rgbs.clone().detach()
             new_gt_rgb = new_gt_rgb.permute(0, 3, 1, 2)
-            shape_code = encoder(new_gt_rgb) # Bx512
+            shape_code = encoder_shape(new_gt_rgb) # Bx128
+            appearence_code = encoder_appearence(new_gt_rgb)
 
             for batch in range(args.batch_size):
                 c2w, gt_rgb, gt_dep = poses[batch], rgbs[batch], depths[batch]
@@ -875,13 +880,14 @@ def train():
             target_d = torch.cat(target_depth_lst, dim=0)
             # print(shape_code)
             # change i.e. remove this line when code_dim=0
-            shape_codes = shape_code.repeat(1, args.N_rand).reshape(-1, args.code_dim)
+            latentcode = torch.cat((shape_code, appearence_code), dim=1)
+            latentcodes = latentcode.repeat(1, args.N_rand).reshape(-1, args.code_dim + args.code_dim)
             # shape_codes = torch.zeros(args.batch_size, 4)
 
             #####  Core optimization loop  #####
 
             rgb, disp, acc, depth, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                     retraw=True, shape_codes=shape_codes,
+                                                     retraw=True, shape_codes=latentcodes,
                                                     **render_kwargs_train)
 
             optimizer.zero_grad()
@@ -946,8 +952,10 @@ def train():
                 print('train poses shape', poses[:4].shape) # 最多render 4张看
                 with torch.no_grad():
                     # shape_code = torch.zeros(4, 4)
-                    shape_code = encoder(rgbs[:4].permute(0, 3, 1, 2).cuda())
-                    rgbs, disps, depths = render_path(poses[:4].to(device), [H, W, focal], K, shape_code, args.chunk, render_kwargs_test, gt_imgs=rgbs[:4], gt_deps=depths[:4], savedir=trainsavedir)
+                    shape_code = encoder_shape(rgbs[:4].permute(0, 3, 1, 2).cuda())
+                    appearence_code = encoder_appearence(rgbs[:4].permute(0, 3, 1, 2).cuda())
+                    latentcode = torch.cat((shape_code, appearence_code), dim=1)
+                    rgbs, disps, depths = render_path(poses[:4].to(device), [H, W, focal], K, latentcode, args.chunk, render_kwargs_test, gt_imgs=rgbs[:4], gt_deps=depths[:4], savedir=trainsavedir)
                 print('Saved train set')
                 tensor_rgbs = [torch.from_numpy(rgb) for rgb in rgbs[:4]]
                 tensor_depths = [torch.from_numpy(depth) for depth in depths[:4]]
@@ -967,8 +975,10 @@ def train():
                 print('test poses shape', poses.shape)
                 with torch.no_grad():
                     # shape_code = torch.zeros(4, 4)
-                    shape_code = encoder(rgbs.permute(0, 3, 1, 2).cuda())
-                    rgbs, disps, depths = render_path(poses.to(device), hwf, K, shape_code, args.chunk, render_kwargs_test, gt_imgs=rgbs, gt_deps=depths, savedir=testsavedir)
+                    shape_code = encoder_shape(rgbs.permute(0, 3, 1, 2).cuda())
+                    appearence_code = encoder_appearence(rgbs[:4].permute(0, 3, 1, 2).cuda())
+                    latentcode = torch.cat((shape_code, appearence_code), dim=1)
+                    rgbs, disps, depths = render_path(poses.to(device), hwf, K, latentcode, args.chunk, render_kwargs_test, gt_imgs=rgbs, gt_deps=depths, savedir=testsavedir)
                 print('Saved test set')
                 tensor_rgbs = [torch.from_numpy(rgb) for rgb in rgbs[:4]]
                 tensor_depths = [torch.from_numpy(depth) for depth in depths[:4]]
@@ -993,8 +1003,10 @@ def train():
                 # Turn on testing mode
                 with torch.no_grad():
                     # shape_code = torch.zeros(4, 4)
-                    shape_code = encoder(rgbs[:1,...].permute(0,3, 1,2).cuda())
-                    rgbs, disps, depths = render_path(render_poses, hwf, K, shape_code, args.chunk, render_kwargs_test)
+                    shape_code = encoder_shape(rgbs[:1,...].permute(0,3, 1,2).cuda())
+                    appearence_code = encoder_appearence(rgbs[:1,...].permute(0, 3, 1, 2).cuda())
+                    latentcode = torch.cat((shape_code, appearence_code), dim=1)
+                    rgbs, disps, depths = render_path(render_poses, hwf, K, latentcode, args.chunk, render_kwargs_test)
                 print('Done, saving', rgbs.shape, disps.shape, depths.shape)
                 moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
                 imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=20, quality=8)
