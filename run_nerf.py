@@ -161,7 +161,10 @@ def render_path(render_poses, hwf, K, shape_code, chunk, render_kwargs, gt_imgs=
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, depth, _ = render(H, W, K, shape_code, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        if i >= shape_code.shape[0]:
+            rgb, disp, acc, depth, _ = render(H, W, K, shape_code, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        else:
+            rgb, disp, acc, depth, _ = render(H, W, K, shape_code[i:i+1, :], chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         # todo : concat g.t. rgb to the predicted rgb
         if gt_imgs is not None:
             output_vs_gt = torch.cat((rgb, gt_imgs[i].to(device)), dim=1)
@@ -942,7 +945,7 @@ def train():
                 os.makedirs(trainsavedir, exist_ok=True)
                 print('train poses shape', poses[:4].shape) # 最多render 4张看
                 with torch.no_grad():
-                    shape_code = torch.zeros(4, 4)
+                    # shape_code = torch.zeros(4, 4)
                     shape_code = encoder(rgbs[:4].permute(0, 3, 1, 2).cuda())
                     rgbs, disps, depths = render_path(poses[:4].to(device), [H, W, focal], K, shape_code, args.chunk, render_kwargs_test, gt_imgs=rgbs[:4], gt_deps=depths[:4], savedir=trainsavedir)
                 print('Saved train set')
@@ -963,7 +966,7 @@ def train():
                 os.makedirs(testsavedir, exist_ok=True)
                 print('test poses shape', poses.shape)
                 with torch.no_grad():
-                    shape_code = torch.zeros(4, 4)
+                    # shape_code = torch.zeros(4, 4)
                     shape_code = encoder(rgbs.permute(0, 3, 1, 2).cuda())
                     rgbs, disps, depths = render_path(poses.to(device), hwf, K, shape_code, args.chunk, render_kwargs_test, gt_imgs=rgbs, gt_deps=depths, savedir=testsavedir)
                 print('Saved test set')
@@ -974,18 +977,22 @@ def train():
 
 
             if i%args.i_video==0 and i > 0 or i == 10:
-                # todo : cuda out of memory
+                
                 try:
                     rgbs, masks, depths, poses, _ = next(test_data_iter)
                 except StopIteration:
                     test_data_iter = iter(test_data)
                     rgbs, masks, depths, poses, _ = next(test_data_iter)
+                
+                rgb8_ = to8b((rgbs[:1,...]).numpy())[0]
+                filename = os.path.join(os.path.join(basedir, expname, '{:06d}_rgb.png'.format(i)))
+                imageio.imwrite(filename, rgb8_)
 
-                render_poses = torch.stack([pose_spherical(angle, 0.8, 1.2) for angle in np.linspace(0,2 * np.pi,30+1)[:-1]], 0)
+                render_poses = torch.stack([pose_spherical(angle, 0.8, 1.2) for angle in np.linspace(0,2 * np.pi,60+1)[:-1]], 0)
                 render_poses = render_poses.to(device)
                 # Turn on testing mode
                 with torch.no_grad():
-                    shape_code = torch.zeros(4, 4)
+                    # shape_code = torch.zeros(4, 4)
                     shape_code = encoder(rgbs[:1,...].permute(0,3, 1,2).cuda())
                     rgbs, disps, depths = render_path(render_poses, hwf, K, shape_code, args.chunk, render_kwargs_test)
                 print('Done, saving', rgbs.shape, disps.shape, depths.shape)

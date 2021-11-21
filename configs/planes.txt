@@ -24,4 +24,4 @@ depth_loss_lambda = 0.0
 img_size = 64
 batch_size = 8
 nepoch = 13
-code_dim = 4
+code_dim = 256

@@ -108,10 +108,10 @@ class ResnetEnc(nn.Module):
         return z.reshape(z.shape[0], -1)
 
 if __name__ == '__main__':
-    resnet = ResnetEnc(z_dim=256, c_dim=3, img_hw=128)
+    resnet = ResnetEnc(z_dim=256, c_dim=3, img_hw=64)
     print(resnet)
 
-    img = torch.rand(4, 3, 128, 128)
+    img = torch.rand(8, 3, 64, 64)
     out = resnet(img)
     print(out.shape)
 
@@ -131,10 +131,10 @@ class NeRF(nn.Module):
         
         # # remove shape_code change 
         self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch + input_code_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
+            [nn.Linear(input_ch + input_code_ch//2, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
         
         ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
-        self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
+        self.views_linears = nn.ModuleList([nn.Linear(input_code_ch//2 + input_ch_views + W, W//2)]) # # 111
 
         ### Implementation according to the paper
         # self.views_linears = nn.ModuleList(
@@ -150,7 +150,7 @@ class NeRF(nn.Module):
     def forward(self, x, shape_codes):
         # Nx63, Nx27
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
-        h = torch.cat((input_pts, shape_codes), dim=1)
+        h = torch.cat((input_pts, shape_codes[:,:128]), dim=1)
         # h = input_pts # # remove shape_code change
         for i, l in enumerate(self.pts_linears):
             h = self.pts_linears[i](h)
@@ -161,7 +161,7 @@ class NeRF(nn.Module):
         if self.use_viewdirs:
             alpha = self.alpha_linear(h)
             feature = self.feature_linear(h)
-            h = torch.cat([feature, input_views], -1)
+            h = torch.cat([feature, input_views, shape_codes[:,128:]], -1) # # 222
         
             for i, l in enumerate(self.views_linears):
                 h = self.views_linears[i](h)
