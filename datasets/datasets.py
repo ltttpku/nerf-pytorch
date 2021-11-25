@@ -1,4 +1,6 @@
 """Datasets"""
+import sys
+sys.path.append('.')
 from imageio.core.functions import imwrite
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -9,6 +11,7 @@ import numpy as np
 import pandas as pd
 import os
 import math
+from utils import binvox_rw
 
 blender_T = np.array([
     [0, 1., 0],
@@ -112,7 +115,7 @@ def pose_spherical(theta, phi, radius):
 
 
 class Plane(Dataset):
-    def __init__(self, img_path, mask_path, depth_path, camera_path, img_size):
+    def __init__(self, img_path, mask_path, depth_path, camera_path, img_size, voxel_path):
         super().__init__()
         self.imgs = glob.glob(img_path)
         self.imgs.sort()
@@ -120,7 +123,9 @@ class Plane(Dataset):
         self.masks.sort()
         self.depths = glob.glob(depth_path)
         self.depths.sort()
-        
+        self.voxels = glob.glob(voxel_path)
+        self.voxels.sort()
+
         assert len(self.imgs) > 0, "Can't find data; make sure you specify the path to your dataset"
         self.to_tensor = transforms.ToTensor()
         self.resize = transforms.Resize((img_size, img_size))
@@ -150,6 +155,10 @@ class Plane(Dataset):
         mask = self.resize(self.to_tensor(mask))
         depth = torch.from_numpy(np.load(self.depths[index])[np.newaxis, ...])
         depth = self.resize(depth)
+        idx = index // 50
+        with open(os.path.join(self.voxels[idx], 'model.binvox'), 'rb') as f:
+            model = binvox_rw.read_as_3d_array(f)
+        voxel_arr = model.data
 
         camera = self.camera_list[index].split(' ')
         az = float(camera[0]) 
@@ -161,7 +170,7 @@ class Plane(Dataset):
         rgb = img.permute(1, 2, 0)
         mask = mask.permute(1, 2, 0)
         rgb = rgb*mask + (1.-mask) # white bg by default
-        return rgb, mask, depth, c2w, [self.img_size, self.img_size, self.focal]
+        return rgb, mask, depth, c2w, [self.img_size, self.img_size, self.focal], voxel_arr
 
 
 class Cars(Dataset):
@@ -233,15 +242,15 @@ class Lego(Dataset):
         return img, mask, az, el, trans
 
 
-def get_dataset(name, img_path, mask_path, depth_path, camera_path, img_size, batch_size=1, shuffle=True):
-    dataset = globals()[name](img_path, mask_path, depth_path, camera_path, img_size)
+def get_dataset(name, img_path, mask_path, depth_path, camera_path, img_size, voxel_path, batch_size=1, shuffle=True):
+    dataset = globals()[name](img_path, mask_path, depth_path, camera_path, img_size, voxel_path)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=True,
         pin_memory=False,
-        num_workers=1
+        num_workers=8
     )
     return dataloader
 
@@ -252,10 +261,11 @@ if __name__ == '__main__':
                             depth_path= '/data2/ShapeNetPlanes/train/depth/*.npy',
                             camera_path = '/data2/ShapeNetPlanes/train/rendering_metadata.txt', 
                             img_size=400,
+                            voxel_path = '/data2/ShapeNetPlanes/train/02691156/*',
                             batch_size=8)
     print(len(train_data))
 
-    for i, (rgb, mask, depth, pose, hwf) in enumerate(train_data):
+    for i, (rgb, mask, depth, pose, hwf, voxel) in enumerate(train_data):
         print(rgb.shape)
         print(rgb[0][1][200])
         d = depth[0].numpy()

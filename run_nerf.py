@@ -38,30 +38,32 @@ def batchify(fn, chunk):
     return ret
 
 
-def run_network(inputs, shape_codes, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
+def run_network(inputs, inputs_padding, shape_codes, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
    
-    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-    embedded = embed_fn(inputs_flat)
-
+    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]]) # # batch_size*N_rand*N_sample x 3
+    inputs_padding_flat = torch.reshape(inputs_padding, [-1, inputs_padding.shape[-1]])
+    embedded = embed_fn(inputs_flat) # # batch_size*N_rand*N_sample x 63
+    embedded = torch.cat((embedded, inputs_padding_flat), dim=-1)
     if viewdirs is not None:
         input_dirs = viewdirs[:,None].expand(inputs.shape)
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = torch.cat([embedded, embedded_dirs], -1)
+        embedded = torch.cat([embedded, embedded_dirs], -1) # # NNN x 90+1 : xyz , dir
+                                                            # #            0:63+1, 63+1:90+1
     # todo : add shape_code
     outputs_flat = batchify(fn, netchunk)(embedded, shape_codes)
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
 
 
-def batchify_rays(rays_flat, shape_codes, chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, shape_codes, voxels, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], shape_codes[i:i+chunk], **kwargs)
+        ret = render_rays(rays_flat[i:i+chunk], shape_codes[i:i+chunk], voxels, **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -71,7 +73,7 @@ def batchify_rays(rays_flat, shape_codes, chunk=1024*32, **kwargs):
     return all_ret
 
 
-def render(H, W, K, shape_codes,chunk=1024*32, rays=None, c2w=None, ndc=True,
+def render(H, W, K, shape_codes,voxels,chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1., 
                   use_viewdirs=False, c2w_staticcam=None,
                   **kwargs):
@@ -100,10 +102,13 @@ def render(H, W, K, shape_codes,chunk=1024*32, rays=None, c2w=None, ndc=True,
     if c2w is not None:
         # special case to render full image
         rays_o, rays_d = get_rays(H, W, K, c2w) # img_sizeximg_sizex3; img_sizeximg_sizex3
+        const_i = torch.full((rays_o.shape[0], rays_o.shape[1], 1), 0)
+        rays_o  = torch.cat((rays_o, const_i), dim=-1)
     else:
         # use provided ray batch
         rays_o, rays_d = rays
 
+    rays_d = rays_d[..., :3]
     if use_viewdirs: # # set in lego.txt
         # provide ray directions as input
         viewdirs = rays_d
@@ -116,10 +121,10 @@ def render(H, W, K, shape_codes,chunk=1024*32, rays=None, c2w=None, ndc=True,
     sh = rays_d.shape # [..., 3]
     if ndc:
         # for forward facing scenes
-        rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
+        rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o[:, :3], rays_d)
 
     # Create ray batch
-    rays_o = torch.reshape(rays_o, [-1,3]).float()
+    rays_o = torch.reshape(rays_o, [-1,4]).float()
     rays_d = torch.reshape(rays_d, [-1,3]).float()
 
     if c2w is not None:
@@ -130,9 +135,10 @@ def render(H, W, K, shape_codes,chunk=1024*32, rays=None, c2w=None, ndc=True,
     rays = torch.cat([rays_o, rays_d, near, far], -1)
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
-
-    # Render and reshape
-    all_ret = batchify_rays(rays, shape_codes, chunk, **kwargs)
+    # rays: 8192 x 12 ; 12: [rays_o, rays_d, near, far, viewdirs]
+    #                           4      3       1    1       3
+    #     # Render and reshape
+    all_ret = batchify_rays(rays, shape_codes, voxels, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
@@ -143,7 +149,7 @@ def render(H, W, K, shape_codes,chunk=1024*32, rays=None, c2w=None, ndc=True,
     return ret_list + [ret_dict]
 
 
-def render_path(render_poses, hwf, K, shape_code, chunk, render_kwargs, gt_imgs=None, gt_deps=None, savedir=None, render_factor=0):
+def render_path(render_poses, hwf, K, voxels, shape_code, chunk, render_kwargs, gt_imgs=None, gt_deps=None, savedir=None, render_factor=0):
 
     H, W, focal = hwf
 
@@ -161,10 +167,10 @@ def render_path(render_poses, hwf, K, shape_code, chunk, render_kwargs, gt_imgs=
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        if i >= shape_code.shape[0]:
-            rgb, disp, acc, depth, _ = render(H, W, K, shape_code, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        if shape_code.shape[0] == 1:
+            rgb, disp, acc, depth, _ = render(H, W, K, shape_code, voxels, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         else:
-            rgb, disp, acc, depth, _ = render(H, W, K, shape_code[i:i+1, :], chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+            rgb, disp, acc, depth, _ = render(H, W, K, shape_code[i:i+1, :], voxels[i:i+1,:], chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         # todo : concat g.t. rgb to the predicted rgb
         if gt_imgs is not None:
             output_vs_gt = torch.cat((rgb, gt_imgs[i].to(device)), dim=1)
@@ -217,7 +223,7 @@ def create_nerf(args):
     output_ch = 4 # https://github.com/yenchenlin/nerf-pytorch/issues/22
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth, input_code_ch=args.code_dim, 
-                 input_ch=input_ch, output_ch=output_ch, skips=skips,
+                 input_ch=input_ch + 1, output_ch=output_ch, skips=skips, # # TODO : +1:vox
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
     grad_vars = list(model.parameters())
 
@@ -227,7 +233,7 @@ def create_nerf(args):
     model_fine = None
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine, input_code_ch=args.code_dim,
-                          input_ch=input_ch, output_ch=output_ch, skips=skips,
+                          input_ch=input_ch + 1, output_ch=output_ch, skips=skips, # # TODO : +1:vox
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
         if len(device_ids)>1:
@@ -242,7 +248,7 @@ def create_nerf(args):
     if len(device_ids)>1:
         encoder_shape=torch.nn.DataParallel(encoder_shape, device_ids=device_ids)#前提是model已经.cuda() 了
 
-    network_query_fn = lambda inputs, shape_codes, viewdirs, network_fn : run_network(inputs, shape_codes, viewdirs, network_fn,
+    network_query_fn = lambda inputs, inputs_padding, shape_codes, viewdirs, network_fn : run_network(inputs, inputs_padding, shape_codes, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
                                                                 netchunk=args.netchunk)
@@ -355,6 +361,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
 
 def render_rays(ray_batch,
                 shape_codes,
+                voxels,
                 network_fn,
                 network_query_fn,
                 N_samples,
@@ -398,9 +405,9 @@ def render_rays(ray_batch,
         sample.
     """
     N_rays = ray_batch.shape[0]
-    rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
-    viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
-    bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
+    rays_o, rays_d, rays_idx_in_vox = ray_batch[:,0:3], ray_batch[:,4:7], ray_batch[:, 3:4] # [N_rays, 3] both; [N_rand, 1]
+    viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 10 else None
+    bounds = torch.reshape(ray_batch[...,7:9], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
     t_vals = torch.linspace(0., 1., steps=N_samples).to(ray_batch.device)
@@ -429,12 +436,18 @@ def render_rays(ray_batch,
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
+    idxs_of_pts = ((pts / 0.57735 + 1) * 64)
+    idxs_of_pts = torch.clamp(idxs_of_pts, 0, 127).long()
+    rays_idx_in_vox = rays_idx_in_vox.repeat(1, N_samples).reshape(N_rays, N_samples, 1).long()
+    pts_padding = voxels[rays_idx_in_vox[:,:,0], idxs_of_pts[:,:,0], idxs_of_pts[:,:,1], idxs_of_pts[:,:,2]]
+    # pts_padding: [N_rays, N_samples, 1]
+    pts_padding = pts_padding.unsqueeze_(-1).to(device).float()
 
 #     raw = run_network(pts)
     # todo : WHAT HERE???
     code_dim = shape_codes.shape[-1]
     input_shape_codes = shape_codes.repeat(1, N_samples).reshape(-1, code_dim)
-    raw = network_query_fn(pts, input_shape_codes, viewdirs, network_fn)
+    raw = network_query_fn(pts, pts_padding, input_shape_codes, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
@@ -447,10 +460,17 @@ def render_rays(ray_batch,
 
         z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
+        idxs_of_pts = ((pts / 0.57735 + 1) * 64)
+        idxs_of_pts = torch.clamp(idxs_of_pts, 0, 127).long()
+        rays_idx_in_vox = ray_batch[:, 3:4]
+        rays_idx_in_vox = rays_idx_in_vox.repeat(1, N_samples + N_importance).reshape(N_rays, N_samples + N_importance, 1).long()
+        pts_padding = voxels[rays_idx_in_vox[:,:,0], idxs_of_pts[:,:,0], idxs_of_pts[:,:,1], idxs_of_pts[:,:,2]]
+        # pts_padding: [N_rays, N_samples, 1]
+        pts_padding = pts_padding.unsqueeze_(-1).to(device).float()
 
         run_fn = network_fn if network_fine is None else network_fine
 #         raw = run_network(pts, fn=run_fn)
-        raw = network_query_fn(pts, shape_codes.repeat(1, N_importance + N_samples).reshape(-1, code_dim), viewdirs, run_fn)
+        raw = network_query_fn(pts, pts_padding, shape_codes.repeat(1, N_importance + N_samples).reshape(-1, code_dim), viewdirs, run_fn)
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
@@ -738,6 +758,7 @@ def train():
                             depth_path= os.path.join(args.train_datadir, 'depth/*.npy'),
                             camera_path = os.path.join(args.train_datadir, 'rendering_metadata.txt'), 
                             img_size=args.img_size,
+                            voxel_path = os.path.join(args.train_datadir, '02691156/*'),
                             batch_size=args.batch_size)
 
     test_data = get_dataset(name=args.name,
@@ -746,12 +767,13 @@ def train():
                             depth_path= os.path.join(args.test_datadir, 'depth/*.npy'),
                             camera_path = os.path.join(args.test_datadir, 'rendering_metadata.txt'), 
                             img_size=args.img_size,
+                            voxel_path = os.path.join(args.test_datadir, '02691156/*'),
                             batch_size=4)
 
     pbar = tqdm(total=args.nepoch * len(train_data))
     test_data_iter = iter(test_data)
     for epoch in range(args.nepoch):
-        for num_iter, (rgbs, masks, depths, poses, hwf) in enumerate(train_data):
+        for num_iter, (rgbs, masks, depths, poses, hwf, voxels) in enumerate(train_data):
             # if args.white_bkgd:
                 
             # else :
@@ -851,14 +873,6 @@ def train():
             #     # print('done')
             #     i_batch = 0
 
-            # # Move training data to GPU
-            # if use_batching:
-            #     rgbs = rgbs.to(device)
-            # poses = poses.to(device)
-            # if use_batching:
-            #     rays_rgb = rays_rgb.to(device)
-
-
             # start = start + 1
 
             time0 = time.time()
@@ -866,18 +880,21 @@ def train():
             batch_rays_lst, target_s_lst, target_depth_lst = [], [], []
             new_gt_rgb = rgbs.clone().detach()
             new_gt_rgb = new_gt_rgb.permute(0, 3, 1, 2)
-            
+            # voxels : batch_size x 128 x 128 x 128
 
             for batch in range(args.batch_size):
                 c2w, gt_rgb, gt_dep = poses[batch], rgbs[batch], depths[batch]
                 batch_rays, target_s, target_d = get_rays_sample(H, W, K, c2w, gt_rgb=gt_rgb, gt_depth=gt_dep[0],i= i,
                                                             precrop_iters=args.precrop_iters, precrop_frac=args.precrop_frac,
-                                                            N_rand=args.N_rand)                
+                                                            N_rand=args.N_rand)   
+                # batch_rays: 2xN_randx3
+                padding = torch.full((2, args.N_rand, 1), batch)
+                batch_rays = torch.cat((batch_rays, padding), dim=-1)             
                 batch_rays_lst.append(batch_rays)
                 target_s_lst.append(target_s)
                 target_depth_lst.append(target_d)
             
-            batch_rays = torch.cat(batch_rays_lst, dim=1)
+            batch_rays = torch.cat(batch_rays_lst, dim=1) # # 2 x (batch_size*N_rand) x 3
             target_s = torch.cat(target_s_lst, dim=0) # (Bx1024) x 3
             target_d = torch.cat(target_depth_lst, dim=0)
             # print(shape_code)
@@ -893,7 +910,7 @@ def train():
                 #####  Core optimization loop  #####
 
                 rgb, disp, acc, depth, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                        retraw=True, shape_codes=latentcodes,
+                                                        retraw=True, shape_codes=latentcodes, voxels=voxels,
                                                         **render_kwargs_train)
 
                 
@@ -973,7 +990,7 @@ def train():
                     shape_code = encoder_shape(rgbs[:4].permute(0, 3, 1, 2).cuda())
                     appearence_code = encoder_appearence(rgbs[:4].permute(0, 3, 1, 2).cuda())
                     latentcode = torch.cat((shape_code, appearence_code), dim=1)
-                    rgbs, disps, depths = render_path(poses[:4].to(device), [H, W, focal], K, latentcode, args.chunk, render_kwargs_test, gt_imgs=rgbs[:4], gt_deps=depths[:4], savedir=trainsavedir)
+                    rgbs, disps, depths = render_path(poses[:4].to(device), hwf, K, voxels[:4].to(device), latentcode, args.chunk, render_kwargs_test, gt_imgs=rgbs[:4], gt_deps=depths[:4], savedir=trainsavedir)
                 print('Saved train set')
                 tensor_rgbs = [torch.from_numpy(rgb) for rgb in rgbs[:4]]
                 tensor_depths = [torch.from_numpy(depth) for depth in depths[:4]]
@@ -983,10 +1000,10 @@ def train():
 
             if i%args.i_testset==0 and i > 0 or i == 3: # change
                 try:
-                    rgbs, masks, depths, poses, _ = next(test_data_iter)
+                    rgbs, masks, depths, poses, _, voxels = next(test_data_iter)
                 except StopIteration:
                     test_data_iter = iter(test_data)
-                    rgbs, masks, depths, poses, _ = next(test_data_iter)
+                    rgbs, masks, depths, poses, _, voxels = next(test_data_iter)
 
                 testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
                 os.makedirs(testsavedir, exist_ok=True)
@@ -996,7 +1013,7 @@ def train():
                     shape_code = encoder_shape(rgbs.permute(0, 3, 1, 2).cuda())
                     appearence_code = encoder_appearence(rgbs[:4].permute(0, 3, 1, 2).cuda())
                     latentcode = torch.cat((shape_code, appearence_code), dim=1)
-                    rgbs, disps, depths = render_path(poses.to(device), hwf, K, latentcode, args.chunk, render_kwargs_test, gt_imgs=rgbs, gt_deps=depths, savedir=testsavedir)
+                    rgbs, disps, depths = render_path(poses.to(device), hwf, K, voxels.to(device), latentcode, args.chunk, render_kwargs_test, gt_imgs=rgbs, gt_deps=depths, savedir=testsavedir)
                 print('Saved test set')
                 tensor_rgbs = [torch.from_numpy(rgb) for rgb in rgbs[:4]]
                 tensor_depths = [torch.from_numpy(depth) for depth in depths[:4]]
@@ -1005,12 +1022,11 @@ def train():
 
 
             if i%args.i_video==0 and i > 0 or i == 10:
-                
                 try:
-                    rgbs, masks, depths, poses, _ = next(test_data_iter)
+                    rgbs, masks, depths, poses, _, voxels = next(test_data_iter)
                 except StopIteration:
                     test_data_iter = iter(test_data)
-                    rgbs, masks, depths, poses, _ = next(test_data_iter)
+                    rgbs, masks, depths, poses, _, voxels= next(test_data_iter)
                 
                 rgb8_ = to8b((rgbs[:1,...]).numpy())[0]
                 filename = os.path.join(os.path.join(basedir, expname, '{:06d}_rgb.png'.format(i)))
@@ -1024,7 +1040,7 @@ def train():
                     shape_code = encoder_shape(rgbs[:1,...].permute(0,3, 1,2).cuda())
                     appearence_code = encoder_appearence(rgbs[:1,...].permute(0, 3, 1, 2).cuda())
                     latentcode = torch.cat((shape_code, appearence_code), dim=1)
-                    rgbs, disps, depths = render_path(render_poses, hwf, K, latentcode, args.chunk, render_kwargs_test)
+                    rgbs, disps, depths = render_path(render_poses, hwf, K, voxels[:1,...].to(device), latentcode, args.chunk, render_kwargs_test)
                 print('Done, saving', rgbs.shape, disps.shape, depths.shape)
                 moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
                 imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=20, quality=8)
