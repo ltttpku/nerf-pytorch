@@ -1,6 +1,8 @@
 expname = plane_test
 basedir = ./logs
-datadir = /data2/ShapeNetRendering
+name = Plane
+train_datadir = /data2/ShapeNetPlanes/train
+test_datadir = /data2/ShapeNetPlanes/test
 dataset_type = syn_plane_aaaaaa
 
 no_batching = False
@@ -9,9 +11,9 @@ use_viewdirs = True
 white_bkgd = True
 lrate_decay = 500
 
-N_samples = 64
-N_importance = 64
-N_rand = 256
+N_samples = 32
+N_importance = 36
+N_rand = 512
 
 precrop_iters = 3000
 precrop_frac = 0.5
@@ -21,7 +23,9 @@ half_res = False
 no_reload = True
 
 depth_loss_lambda = 0.0
-img_size = 64
-batch_size = 8
-nepoch = 13
+img_size = 128
+batch_size = 16
+nepoch = 25
 code_dim = 128
+
+amp = True

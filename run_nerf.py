@@ -249,7 +249,7 @@ def create_nerf(args):
 
     # Create optimizer
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
-
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
     start = 0
     basedir = args.basedir
     expname = args.expname
@@ -304,7 +304,7 @@ def create_nerf(args):
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
 
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, encoder_shape, encoder_appearence
+    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, grad_scaler, encoder_shape, encoder_appearence
 
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
@@ -475,16 +475,20 @@ def config_parser():
 
     import configargparse
     parser = configargparse.ArgumentParser()
+    parser.add_argument('--name', type=str, default='Plane')
     parser.add_argument('--config', is_config_file=True, default='configs/planes.txt',  # change
                         help='config file path')
     parser.add_argument("--expname", type=str, 
                         help='experiment name')
     parser.add_argument("--basedir", type=str, default='./logs/', 
                         help='where to store ckpts and logs')
-    parser.add_argument("--datadir", type=str, default='./data/llff/fern', 
-                        help='input data directory')
+    parser.add_argument("--train_datadir", type=str,
+                        help='input train data directory')
+    parser.add_argument("--test_datadir", type=str, 
+                        help='input test data directory')
 
     # training options
+    parser.add_argument("--amp", type=bool, default=True, help="use amp or not")
     parser.add_argument("--code_dim", type=int, default=512, # change
                         help='num of total epoches')
     parser.add_argument("--img_size", type=int, default=128, # change
@@ -590,7 +594,7 @@ def config_parser():
                         help='frequency of testset saving')
     parser.add_argument("--i_testset", type=int, default=2000, # change
                         help='frequency of testset saving')
-    parser.add_argument("--i_video",   type=int, default=2000, # change
+    parser.add_argument("--i_video",   type=int, default=4000, # change
                         help='frequency of render_poses video saving')
 
     return parser
@@ -721,27 +725,26 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, encoder_shape , encoder_appearence= create_nerf(args)
+    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, grad_scaler, encoder_shape , encoder_appearence= create_nerf(args)
     global_step = start
 
 
     # todo : why have to add this line
     torch.multiprocessing.set_start_method('spawn') # https://blog.csdn.net/qazwsxrx/article/details/116806358
 
-    train_data = get_dataset(name='Plane',
-                            img_path= '/data2/ShapeNetPlanes/train/rgb/*.png',
-                            mask_path= '/data2/ShapeNetPlanes/train/mask/*.png',
-                            depth_path= '/data2/ShapeNetPlanes/train/depth/*.npy',
-                            camera_path = '/data2/ShapeNetPlanes/train/rendering_metadata.txt', 
+    train_data = get_dataset(name=args.name,
+                            img_path= os.path.join(args.train_datadir, 'rgb/*.png'),
+                            mask_path= os.path.join(args.train_datadir, 'mask/*.png'),
+                            depth_path= os.path.join(args.train_datadir, 'depth/*.npy'),
+                            camera_path = os.path.join(args.train_datadir, 'rendering_metadata.txt'), 
                             img_size=args.img_size,
                             batch_size=args.batch_size)
 
-    # # change 
-    test_data = get_dataset(name='Plane',
-                            img_path= '/data2/ShapeNetPlanes/test/rgb/*.png',
-                            mask_path= '/data2/ShapeNetPlanes/test/mask/*.png',
-                            depth_path= '/data2/ShapeNetPlanes/test/depth/*.npy',
-                            camera_path = '/data2/ShapeNetPlanes/test/rendering_metadata.txt', 
+    test_data = get_dataset(name=args.name,
+                            img_path= os.path.join(args.test_datadir, 'rgb/*.png'),
+                            mask_path= os.path.join(args.test_datadir, 'mask/*.png'),
+                            depth_path= os.path.join(args.test_datadir, 'depth/*.npy'),
+                            camera_path = os.path.join(args.test_datadir, 'rendering_metadata.txt'), 
                             img_size=args.img_size,
                             batch_size=4)
 
@@ -757,8 +760,8 @@ def train():
             pbar.update(1)
             i = epoch * len(train_data) + num_iter
 
-            near = 0.7
-            far = 1.7
+            near = 0.5
+            far = 1.9
             # Cast intrinsics to right types
             H, W, focal = hwf[0][0], hwf[1][0], hwf[2][0]
             H, W, focal = int(H), int(W), float(focal)
@@ -863,8 +866,7 @@ def train():
             batch_rays_lst, target_s_lst, target_depth_lst = [], [], []
             new_gt_rgb = rgbs.clone().detach()
             new_gt_rgb = new_gt_rgb.permute(0, 3, 1, 2)
-            shape_code = encoder_shape(new_gt_rgb) # Bx128
-            appearence_code = encoder_appearence(new_gt_rgb)
+            
 
             for batch in range(args.batch_size):
                 c2w, gt_rgb, gt_dep = poses[batch], rgbs[batch], depths[batch]
@@ -880,45 +882,55 @@ def train():
             target_d = torch.cat(target_depth_lst, dim=0)
             # print(shape_code)
             # change i.e. remove this line when code_dim=0
-            latentcode = torch.cat((shape_code, appearence_code), dim=1)
-            latentcodes = latentcode.repeat(1, args.N_rand).reshape(-1, args.code_dim + args.code_dim)
-            # shape_codes = torch.zeros(args.batch_size, 4)
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                shape_code = encoder_shape(new_gt_rgb) # Bx128
+                appearence_code = encoder_appearence(new_gt_rgb)
 
-            #####  Core optimization loop  #####
+                latentcode = torch.cat((shape_code, appearence_code), dim=1)
+                latentcodes = latentcode.repeat(1, args.N_rand).reshape(-1, args.code_dim + args.code_dim)
+                # shape_codes = torch.zeros(args.batch_size, 4)
 
-            rgb, disp, acc, depth, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                     retraw=True, shape_codes=latentcodes,
-                                                    **render_kwargs_train)
+                #####  Core optimization loop  #####
 
-            optimizer.zero_grad()
-            img_loss = img2mse(rgb, target_s)
-            trans = extras['raw'][...,-1]
-            losses_dct = {'img_loss': img_loss}
-            loss = img_loss
-            psnr = mse2psnr(img_loss)
-            # todo : rgb0:pixel / rgb ?
-            if 'rgb0' in extras:
-                img_loss0 = img2mse(extras['rgb0'], target_s)
-                losses_dct['img_loss0'] = img_loss0
-                loss = loss + img_loss0
-                psnr0 = mse2psnr(img_loss0)
+                rgb, disp, acc, depth, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                        retraw=True, shape_codes=latentcodes,
+                                                        **render_kwargs_train)
+
+                
+                img_loss = img2mse(rgb, target_s)
+                trans = extras['raw'][...,-1]
+                losses_dct = {'img_loss': img_loss}
+                loss = img_loss
+                psnr = mse2psnr(img_loss)
+                # todo : rgb0:pixel / rgb ?
+                if 'rgb0' in extras:
+                    img_loss0 = img2mse(extras['rgb0'], target_s)
+                    losses_dct['img_loss0'] = img_loss0
+                    loss = loss + img_loss0
+                    psnr0 = mse2psnr(img_loss0)
+                
+                depth_loss = 0.0
+                if args.depth_loss_lambda > 0:
+                    # depth_loss = torch.mean((((depth_col - target_depth) / max_depth) ** 2) * ray_weights)
+                    depth_loss = img2mse(depth, target_d)
+                    # depth_loss = torch.mean(((depth - target_d) / target_d)**2)
+                    loss += args.depth_loss_lambda * depth_loss
+                    losses_dct['depth_loss'] = depth_loss
+                    # DSNeRF did't add this term of loss
+                    # if 'dep0' in extras:
+                    #     depth_loss0 = img2mse(extras['dep0'], target_d)
+                    #     loss += args.depth_loss_lambda * depth_loss0
+                    #     losses_dct['depth_loss0'] = depth_loss0
             
-            depth_loss = 0
-            if args.depth_loss_lambda > 0:
-                # depth_loss = torch.mean((((depth_col - target_depth) / max_depth) ** 2) * ray_weights)
-                depth_loss = img2mse(depth, target_d)
-                # depth_loss = torch.mean(((depth - target_d) / target_d)**2)
-                loss += args.depth_loss_lambda * depth_loss
-                losses_dct['depth_loss'] = depth_loss
-                # DSNeRF did't add this term of loss
-                # if 'dep0' in extras:
-                #     depth_loss0 = img2mse(extras['dep0'], target_d)
-                #     loss += args.depth_loss_lambda * depth_loss0
-                #     losses_dct['depth_loss0'] = depth_loss0
-
-            loss.backward()
-            optimizer.step()
-
+            # optimizer.zero_grad()
+            # loss.backward()
+            # optimizer.step()
+        
+            optimizer.zero_grad(set_to_none=True)
+            grad_scaler.scale(loss).backward()
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+            
             # NOTE: IMPORTANT!
             ###   update learning rate   ###
             decay_rate = 0.1
