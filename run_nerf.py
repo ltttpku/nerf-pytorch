@@ -164,7 +164,7 @@ def render_path(render_poses, hwf, K, shape_code, chunk, render_kwargs, gt_imgs=
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        if i >= shape_code.shape[0]:
+        if shape_code.shape[0] == 1:
             rgb, disp, acc, depth, _ = render(H, W, K, shape_code, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         else:
             rgb, disp, acc, depth, _ = render(H, W, K, shape_code[i:i+1, :], chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
