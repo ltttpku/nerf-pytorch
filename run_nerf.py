@@ -1,6 +1,8 @@
+from genericpath import exists
 import os, sys
 from pickle import encode_long
 import numpy as np
+from numpy import *
 import imageio
 import json
 import random
@@ -162,6 +164,8 @@ def render_path(render_poses, hwf, K, voxels, shape_code, chunk, render_kwargs, 
     rgbs = []
     disps = []
     depths = []
+    test_psnrs = []
+    test_losses = []
 
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
@@ -173,6 +177,10 @@ def render_path(render_poses, hwf, K, voxels, shape_code, chunk, render_kwargs, 
             rgb, disp, acc, depth, _ = render(H, W, K, shape_code[i:i+1, :], voxels[i:i+1,:], chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
         # todo : concat g.t. rgb to the predicted rgb
         if gt_imgs is not None:
+            tmp_loss = img2mse(rgb, gt_imgs[i].to(device))
+            test_losses.append(tmp_loss.item())
+            test_psnrs.append(mse2psnr(tmp_loss).item())
+
             output_vs_gt = torch.cat((rgb, gt_imgs[i].to(device)), dim=1)
             rgbs.append(output_vs_gt.cpu().numpy())
         else:
@@ -207,7 +215,7 @@ def render_path(render_poses, hwf, K, voxels, shape_code, chunk, render_kwargs, 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
     depths = np.stack(depths, 0)
-    return rgbs, disps, depths
+    return rgbs, disps, depths, test_losses, test_psnrs
 
 
 def create_nerf(args):
@@ -768,7 +776,8 @@ def train():
                             camera_path = os.path.join(args.test_datadir, 'rendering_metadata.txt'), 
                             img_size=args.img_size,
                             voxel_path = os.path.join(args.test_datadir, '02691156/*'),
-                            batch_size=4)
+                            batch_size=4,
+                            shuffle=False)
 
     pbar = tqdm(total=args.nepoch * len(train_data))
     test_data_iter = iter(test_data)
@@ -973,6 +982,15 @@ def train():
                     'encoder_shape_state_dict': encoder_shape.state_dict(),
                     'encoder_appearence_state_dict': encoder_appearence.state_dict(),
                 }, path)
+                os.makedirs(os.path.join(path, 'models', TIMESTAMP), exist_ok=True)
+                torch.save({
+                    'global_step': global_step,
+                    'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
+                    'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'encoder_shape_state_dict': encoder_shape.state_dict(),
+                    'encoder_appearence_state_dict': encoder_appearence.state_dict(),
+                }, os.path.join(path, 'models', TIMESTAMP))
                 print('Saved checkpoints at', path)
                 logger.save_stats('stats.p')
                 print("Saved logger")
@@ -990,7 +1008,7 @@ def train():
                     shape_code = encoder_shape(rgbs[:4].permute(0, 3, 1, 2).cuda())
                     appearence_code = encoder_appearence(rgbs[:4].permute(0, 3, 1, 2).cuda())
                     latentcode = torch.cat((shape_code, appearence_code), dim=1)
-                    rgbs, disps, depths = render_path(poses[:4].to(device), hwf, K, voxels[:4].to(device), latentcode, args.chunk, render_kwargs_test, gt_imgs=rgbs[:4], gt_deps=depths[:4], savedir=trainsavedir)
+                    rgbs, disps, depths, _, __= render_path(poses[:4].to(device), hwf, K, voxels[:4].to(device), latentcode, args.chunk, render_kwargs_test, gt_imgs=rgbs[:4], gt_deps=depths[:4], savedir=trainsavedir)
                 print('Saved train set')
                 tensor_rgbs = [torch.from_numpy(rgb) for rgb in rgbs[:4]]
                 tensor_depths = [torch.from_numpy(depth) for depth in depths[:4]]
@@ -1013,13 +1031,14 @@ def train():
                     shape_code = encoder_shape(rgbs.permute(0, 3, 1, 2).cuda())
                     appearence_code = encoder_appearence(rgbs[:4].permute(0, 3, 1, 2).cuda())
                     latentcode = torch.cat((shape_code, appearence_code), dim=1)
-                    rgbs, disps, depths = render_path(poses.to(device), hwf, K, voxels.to(device), latentcode, args.chunk, render_kwargs_test, gt_imgs=rgbs, gt_deps=depths, savedir=testsavedir)
+                    rgbs, disps, depths, test_losses, test_psnrs = render_path(poses.to(device), hwf, K, voxels.to(device), latentcode, args.chunk, render_kwargs_test, gt_imgs=rgbs, gt_deps=depths, savedir=testsavedir)
                 print('Saved test set')
                 tensor_rgbs = [torch.from_numpy(rgb) for rgb in rgbs[:4]]
                 tensor_depths = [torch.from_numpy(depth) for depth in depths[:4]]
                 logger.add_imgs(torch.stack(tensor_rgbs, dim=0).permute(0, 3, 1, 2), 'test/rgb', i)
                 logger.add_imgs(torch.stack(tensor_depths, dim=0).unsqueeze(1), 'test/depth', i)
-
+                logger.add('test_loss', 'rgb_loss', mean(test_losses), i // args.i_testset)
+                logger.add('test_loss', 'psnr', mean(test_psnrs), i // args.i_testset)
 
             if i%args.i_video==0 and i > 0 or i == 10:
                 try:
@@ -1040,7 +1059,7 @@ def train():
                     shape_code = encoder_shape(rgbs[:1,...].permute(0,3, 1,2).cuda())
                     appearence_code = encoder_appearence(rgbs[:1,...].permute(0, 3, 1, 2).cuda())
                     latentcode = torch.cat((shape_code, appearence_code), dim=1)
-                    rgbs, disps, depths = render_path(render_poses, hwf, K, voxels[:1,...].to(device), latentcode, args.chunk, render_kwargs_test)
+                    rgbs, disps, depths, _, __ = render_path(render_poses, hwf, K, voxels[:1,...].to(device), latentcode, args.chunk, render_kwargs_test)
                 print('Done, saving', rgbs.shape, disps.shape, depths.shape)
                 moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
                 imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=20, quality=8)
